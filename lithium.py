@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 import getopt, sys, os, subprocess
 
+# This is used for minimizing the number of strings.
+import re, string
+
 def usage():
     print """Lithium, an automated testcase reduction tool by Jesse Ruderman
     
@@ -46,6 +49,8 @@ minimizeMin = 1
 minimizeMax = pow(2, 30)
     
 atom = "line"
+cutAfter = "?=;{["
+cutBefore = "]}:"
 
 conditionScript = None
 conditionArgs = None
@@ -70,7 +75,11 @@ def main():
     global parts
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hc", ["help", "char", "strategy=", "repeat=", "min=", "max=", "chunksize=", "testcase=", "tempdir="])
+        opts, args = getopt.getopt(sys.argv[1:], "hcs", [
+            "help",
+            "char", "symbols", "cutBefore=", "cutAfter=",
+            "strategy=", "repeat=", "min=", "max=", "chunksize=",
+            "testcase=", "tempdir="])
     except getopt.GetoptError, exc:
         usageError(exc.msg)
 
@@ -110,6 +119,10 @@ def main():
 
     strategyFunction = {
         'minimize': minimize,
+        'minimize-around': minimizeSurroundingPairs,
+        'minimize-balanced': minimizeBalancedPairs,
+        'replace-properties-by-globals': replacePropertiesByGlobals,
+        'replace-arguments-by-globals': replaceArgumentsByGlobals,
         'remove-pair': tryRemovingPair,
         'remove-adjacent-pairs': tryRemovingAdjacentPairs,
         'remove-substring': tryRemovingSubstring
@@ -131,7 +144,7 @@ def main():
 
 
 def processOptions(opts):
-    global atom, minimizeRepeat, minimizeMin, minimizeMax, strategy, testcaseFilename, tempDir
+    global atom, cutBefore, cutAfter, minimizeRepeat, minimizeMin, minimizeMax, strategy, testcaseFilename, tempDir
 
     for o, a in opts:
         if o in ("-h", "--help"):
@@ -143,6 +156,12 @@ def processOptions(opts):
             tempDir = a
         elif o in ("-c", "--char"): 
             atom = "char"
+        elif o in ("-s", "--symbols"):
+            atom = "symbol-delimiter"
+        elif o in ("--cut-after"):
+            cutAfter = str(a)
+        elif o in ("--cut-before"):
+            cutBefore = str(a)
         elif o == "--strategy":
             strategy = a
         elif o == "--min":
@@ -241,6 +260,10 @@ def readTestcaseLine(line):
     elif atom == "char":
         for char in line:
             parts.append(char)
+    elif atom == "symbol-delimiter":
+        cutter = '[' + cutBefore + ']?[^' + cutBefore + cutAfter + ']*(?:[' + cutAfter + ']|$|(?=[' + cutBefore + ']))'
+        for statement in re.finditer(cutter, line):
+            parts.append(statement.group(0))
 
 def writeTestcase(filename):
     file = open(filename, "w")
@@ -282,7 +305,7 @@ def interesting(partsSuggestion):
     parts = partsSuggestion
 
     writeTestcase(testcaseFilename)
-    
+
     testCount += 1
     testTotal += len(parts)
 
@@ -393,11 +416,772 @@ def tryRemovingChunks(chunkSize):
     writeTestcaseTemp("did-round-" + str(chunkSize), True);
    
     return (chunksRemoved > 0)
+
+
+
+#
+# This Strategy attempt at removing pairs of chuncks which might be surrounding
+# interesting code, but which cannot be removed independently of the other.
+# This happens frequently with patterns such as:
+#
+#   if (cond) {
+#      interesting();
+#   }
+#
+# The value of the condition might not be interesting, but in order to reach the
+# interesting code we still have to compute it, and keep extra code alive.
+#
+def minimizeSurroundingPairs():
+    origNumParts = len(parts)
+    chunkSize = min(minimizeMax, largestPowerOfTwoSmallerThan(origNumParts))
+    finalChunkSize = max(minimizeMin, 1)
+
+    while 1:
+        anyChunksRemoved = tryRemovingSurroundingChunks(chunkSize);
+
+        last = (chunkSize == finalChunkSize)
+
+        if anyChunksRemoved and (minimizeRepeat == "always" or (minimizeRepeat == "last" and last)):
+            # Repeat with the same chunk size
+            pass
+        elif last:
+            # Done
+            break
+        else:
+            # Continue with the next smaller chunk size
+            chunkSize /= 2
+
+    writeTestcase(testcaseFilename)
     
+    print "Lithium is done!"
+
+    if finalChunkSize == 1 and minimizeRepeat != "never":
+        print "  Removing any single " + atom + " from the final file makes it uninteresting!"
+
+    print "  Initial size: " + quantity(origNumParts, atom)
+    print "  Final size: " + quantity(len(parts), atom)
+    print "  Tests performed: " + str(testCount)
+    print "  Test total: " + quantity(testTotal, atom)
+
+def list_rindex(l, p, e):
+    if p < 0 or p > len(l):
+        raise ValueError("%s is not in list" % str(e))
+    for index, item in enumerate(reversed(l[:p])):
+        if item == e:
+            return p - index - 1
+    raise ValueError("%s is not in list" % str(e))
+
+def list_nindex(l, p, e):
+    if p + 1 >= len(l):
+        raise ValueError("%s is not in list" % str(e))
+    return l[(p + 1):].index(e) + (p + 1)
+
+def tryRemovingSurroundingChunks(chunkSize):
+    """Make a single run through the testcase, trying to remove chunks of size chunkSize.
+
+    Returns True iff any chunks were removed."""
+
+    global parts
+
+    chunksSoFar = 0
+    summary = ""
+
+    chunksRemoved = 0
+    chunksSurviving = 0
+    atomsRemoved = 0
+
+    atomsInitial = len(parts)
+    numChunks = divideRoundingUp(len(parts), chunkSize)
+
+    # Not enough chunks to remove surrounding blocks.
+    if numChunks < 3:
+        return False
+
+    print "Starting a round with chunks of " + quantity(chunkSize, atom) + "."
+
+    summary = ['S' for i in range(numChunks)]
+    chunkStart = chunkSize
+    beforeChunkIdx = 0
+    keepChunkIdx = 1
+    afterChunkIdx = 2
+
+    try:
+        while chunkStart + chunkSize < len(parts):
+            chunkBefStart = max(0, chunkStart - chunkSize)
+            chunkBefEnd = chunkStart
+            chunkAftStart = min(len(parts), chunkStart + chunkSize)
+            chunkAftEnd = min(len(parts), chunkAftStart + chunkSize)
+            description = "chunk #" + str(beforeChunkIdx) + " & #" + str(afterChunkIdx) + " of " + str(numChunks) + " chunks of size " + str(chunkSize)
+
+            if interesting(parts[:chunkBefStart] + parts[chunkBefEnd:chunkAftStart] + parts[chunkAftEnd:]):
+                print "Yay, reduced it by removing " + description + " :)"
+                chunksRemoved += 2
+                atomsRemoved += (chunkBefEnd - chunkBefStart)
+                atomsRemoved += (chunkAftEnd - chunkAftStart)
+                summary[beforeChunkIdx] = '-'
+                summary[afterChunkIdx] = '-'
+                # The start is now sooner since we remove the chunk which was before this one.
+                chunkStart -= chunkSize
+                try:
+                    # Try to keep removing surrounding chunks of the same part.
+                    beforeChunkIdx = list_rindex(summary, keepChunkIdx, 'S')
+                except ValueError:
+                    # There is no more survinving block on the left-hand-side of
+                    # the current chunk, shift everything by one surviving
+                    # block. Any ValueError from here means that there is no
+                    # longer enough chunk.
+                    beforeChunkIdx = keepChunkIdx
+                    keepChunkIdx = list_nindex(summary, keepChunkIdx, 'S')
+                    chunkStart += chunkSize
+            else:
+                print "Removing " + description + " made the file 'uninteresting'."
+                # Shift chunk indexes, and seek the next surviving chunk. ValueError
+                # from here means that there is no longer enough chunks.
+                beforeChunkIdx = keepChunkIdx
+                keepChunkIdx = afterChunkIdx
+                chunkStart += chunkSize
+
+            afterChunkIdx = list_nindex(summary, keepChunkIdx, 'S')
+
+    except ValueError:
+        # This is a valid loop exit point.
+        chunkStart = len(parts)
+
+    atomsSurviving = atomsInitial - atomsRemoved
+    printableSummary = " ".join(["".join(summary[(2 * i):min(2 * (i + 1), numChunks + 1)]) for i in range(numChunks / 2 + numChunks % 2)])
+    print ""
+    print "Done with a round of chunk size " + str(chunkSize) + "!"
+    print quantity(summary.count('S'), "chunk") + " survived; " + \
+          quantity(summary.count('-'), "chunk") + " removed."
+    print quantity(atomsSurviving, atom) + " survived; " + \
+          quantity(atomsRemoved, atom) + " removed."
+    print "Which chunks survived: " + printableSummary
+    print ""
+
+    writeTestcaseTemp("did-round-" + str(chunkSize), True);
+
+    return (chunksRemoved > 0)
+
+
+#
+# This Strategy attempt at removing balanced chuncks which might be surrounding
+# interesting code, but which cannot be removed independently of the other.
+# This happens frequently with patterns such as:
+#
+#   if (cond) {
+#      ...;
+#      ...;
+#      interesting();
+#      ...;
+#      ...;
+#   }
+#
+# The value of the condition might not be interesting, but in order to reach the
+# interesting code we still have to compute it, and keep extra code alive.
+#
+def minimizeBalancedPairs():
+    origNumParts = len(parts)
+    chunkSize = min(minimizeMax, largestPowerOfTwoSmallerThan(origNumParts))
+    finalChunkSize = max(minimizeMin, 1)
+
+    while 1:
+        anyChunksRemoved = tryRemovingBalancedPairs(chunkSize);
+
+        last = (chunkSize == finalChunkSize)
+
+        if anyChunksRemoved and (minimizeRepeat == "always" or (minimizeRepeat == "last" and last)):
+            # Repeat with the same chunk size
+            pass
+        elif last:
+            # Done
+            break
+        else:
+            # Continue with the next smaller chunk size
+            chunkSize /= 2
+
+    writeTestcase(testcaseFilename)
+
+    print "Lithium is done!"
+
+    if finalChunkSize == 1 and minimizeRepeat != "never":
+        print "  Removing any single " + atom + " from the final file makes it uninteresting!"
+
+    print "  Initial size: " + quantity(origNumParts, atom)
+    print "  Final size: " + quantity(len(parts), atom)
+    print "  Tests performed: " + str(testCount)
+    print "  Test total: " + quantity(testTotal, atom)
+
+def list_fiveParts(list, step, f, s, t):
+    return (list[:f], list[f:s], list[s:(s+step)], list[(s+step):(t+step)], list[(t+step):])
+
+def tryRemovingBalancedPairs(chunkSize):
+    """Make a single run through the testcase, trying to remove chunks of size chunkSize.
+
+    Returns True iff any chunks were removed."""
+
+    global parts
+
+    chunksSoFar = 0
+    summary = ""
+
+    chunksRemoved = 0
+    chunksSurviving = 0
+    atomsRemoved = 0
+
+    atomsInitial = len(parts)
+    numChunks = divideRoundingUp(len(parts), chunkSize)
+
+    # Not enough chunks to remove surrounding blocks.
+    if numChunks < 2:
+        return False
+
+    print "Starting a round with chunks of " + quantity(chunkSize, atom) + "."
+
+    summary = ['S' for i in range(numChunks)]
+    curly = [(parts[i].count('{') - parts[i].count('}')) for i in range(numChunks)]
+    square = [(parts[i].count('{') - parts[i].count('}')) for i in range(numChunks)]
+    normal = [(parts[i].count('(') - parts[i].count(')')) for i in range(numChunks)]
+    chunkStart = 0
+    lhsChunkIdx = 0
+
+    try:
+        while chunkStart < len(parts):
+
+            description = "chunk #" + str(lhsChunkIdx) + "".join([" " for i in range(len(str(lhsChunkIdx)) + 4)])
+            description += " of " + str(numChunks) + " chunks of size " + str(chunkSize)
+
+            assert summary[:lhsChunkIdx].count('S') * chunkSize == chunkStart, "the chunkStart should correspond to the lhsChunkIdx modulo the removed chunks."
+
+            chunkLhsStart = chunkStart
+            chunkLhsEnd = min(len(parts), chunkLhsStart + chunkSize)
+
+            nCurly = curly[lhsChunkIdx]
+            nSquare = square[lhsChunkIdx]
+            nNormal = normal[lhsChunkIdx]
+
+            # If the chunk is already balanced, try to remove it.
+            if nCurly == 0 and nSquare == 0 and nNormal == 0:
+                if interesting(parts[:chunkLhsStart] + parts[chunkLhsEnd:]):
+                    print "Yay, reduced it by removing " + description + " :)"
+                    chunksRemoved += 1
+                    atomsRemoved += (chunkLhsEnd - chunkLhsStart)
+                    summary[lhsChunkIdx] = '-'
+                else:
+                    print "Removing " + description + " made the file 'uninteresting'."
+                    chunkStart += chunkSize
+                lhsChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+                continue
+
+            # Otherwise look for the corresponding chunk.
+            rhsChunkIdx = lhsChunkIdx
+            for item in summary[(lhsChunkIdx + 1):]:
+                rhsChunkIdx += 1
+                if item != 'S':
+                    continue
+                nCurly += curly[rhsChunkIdx]
+                nSquare += square[rhsChunkIdx]
+                nNormal += normal[rhsChunkIdx]
+                if nCurly < 0 or nSquare < 0 or nNormal < 0:
+                    break
+                if nCurly == 0 and nSquare == 0 and nNormal == 0:
+                    break
+
+            # If we have no match, then just skip this pair of chunks.
+            if nCurly != 0 or nSquare != 0 or nNormal != 0:
+                print "Skipping " + description + " because it is 'uninteresting'."
+                chunkStart += chunkSize
+                lhsChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+                continue
+
+            # Otherwise we do have a match and we check if this is interesting to remove both.
+            chunkRhsStart = chunkLhsStart + chunkSize * summary[lhsChunkIdx:rhsChunkIdx].count('S')
+            chunkRhsStart = min(len(parts), chunkRhsStart)
+            chunkRhsEnd = min(len(parts), chunkRhsStart + chunkSize)
+
+            description = "chunk #" + str(lhsChunkIdx) + " & #" + str(rhsChunkIdx)
+            description += " of " + str(numChunks) + " chunks of size " + str(chunkSize)
+
+            if interesting(parts[:chunkLhsStart] + parts[chunkLhsEnd:chunkRhsStart] + parts[chunkRhsEnd:]):
+                print "Yay, reduced it by removing " + description + " :)"
+                chunksRemoved += 2
+                atomsRemoved += (chunkLhsEnd - chunkLhsStart)
+                atomsRemoved += (chunkRhsEnd - chunkRhsStart)
+                summary[lhsChunkIdx] = '-'
+                summary[rhsChunkIdx] = '-'
+                lhsChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+                continue
+
+            # Removing the braces make the failure disappear.  As we are looking
+            # for removing chunk (braces), we need to make the content within
+            # the braces as minimal as possible, so let us try to see if we can
+            # move the chunks outside the braces.
+            print "Removing " + description + " made the file 'uninteresting'."
+
+            # Moving chunks is still a bit experimental, and it can introduce reducing loops.
+            # If you want to try it, just replace this True by a False.
+            if True:
+                chunkStart += chunkSize
+                lhsChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+                continue
+
+            origChunkIdx = lhsChunkIdx
+            stayOnSameChunk = False
+            chunkMidStart = chunkLhsEnd
+            midChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+            while chunkMidStart < chunkRhsStart:
+                assert summary[:midChunkIdx].count('S') * chunkSize == chunkMidStart, "the chunkMidStart should correspond to the midChunkIdx modulo the removed chunks."
+                description = "chunk #" + str(midChunkIdx) + "".join([" " for i in range(len(str(lhsChunkIdx)) + 4)])
+                description += " of " + str(numChunks) + " chunks of size " + str(chunkSize)
+
+                chunkMidEnd = chunkMidStart + chunkSize
+                p = list_fiveParts(parts, chunkSize, chunkLhsStart, chunkMidStart, chunkRhsStart)
+
+                nCurly = curly[midChunkIdx]
+                nSquare = square[midChunkIdx]
+                nNormal = normal[midChunkIdx]
+                if nCurly != 0 or nSquare != 0 or nNormal != 0:
+                    print "Keepping " + description + " because it is 'uninteresting'."
+                    chunkMidStart += chunkSize
+                    midChunkIdx = list_nindex(summary, midChunkIdx, 'S')
+                    continue
+
+                # Try moving the chunk after.
+                if interesting(p[0] + p[1] + p[3] + p[2] + p[4]):
+                    print "->Moving " + description + " kept the file 'interesting'."
+                    chunkRhsStart -= chunkSize
+                    chunkRhsEnd -= chunkSize
+                    tS = list_fiveParts(summary, 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    tc = list_fiveParts(curly  , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    ts = list_fiveParts(square , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    tn = list_fiveParts(normal , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    summary = tS[0] + tS[1] + tS[3] + tS[2] + tS[4]
+                    curly =   tc[0] + tc[1] + tc[3] + tc[2] + tc[4]
+                    square =  ts[0] + ts[1] + ts[3] + ts[2] + ts[4]
+                    normal =  tn[0] + tn[1] + tn[3] + tn[2] + tn[4]
+                    rhsChunkIdx -= 1
+                    midChunkIdx = summary[midChunkIdx:].index('S') + midChunkIdx
+                    continue
+
+                # Try moving the chunk before.
+                if interesting(p[0] + p[2] + p[1] + p[3] + p[4]):
+                    print "<-Moving " + description + " kept the file 'interesting'."
+                    chunkLhsStart += chunkSize
+                    chunkLhsEnd += chunkSize
+                    chunkMidStart += chunkSize
+                    tS = list_fiveParts(summary, 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    tc = list_fiveParts(curly  , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    ts = list_fiveParts(square , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    tn = list_fiveParts(normal , 1, lhsChunkIdx, midChunkIdx, rhsChunkIdx)
+                    summary = tS[0] + tS[2] + tS[1] + tS[3] + tS[4]
+                    curly =   tc[0] + tc[2] + tc[1] + tc[3] + tc[4]
+                    square =  ts[0] + ts[2] + ts[1] + ts[3] + ts[4]
+                    normal =  tn[0] + tn[2] + tn[1] + tn[3] + tn[4]
+                    lhsChunkIdx += 1
+                    midChunkIdx = list_nindex(summary, midChunkIdx, 'S')
+                    stayOnSameChunk = True
+                    continue
+
+                print "..Moving " + description + " made the file 'uninteresting'."
+                chunkMidStart += chunkSize
+                midChunkIdx = list_nindex(summary, midChunkIdx, 'S')
+
+            lhsChunkIdx = origChunkIdx
+            if not stayOnSameChunk:
+                chunkStart += chunkSize
+                lhsChunkIdx = list_nindex(summary, lhsChunkIdx, 'S')
+
+
+    except ValueError:
+        # This is a valid loop exit point.
+        chunkStart = len(parts)
+
+    atomsSurviving = atomsInitial - atomsRemoved
+    printableSummary = " ".join(["".join(summary[(2 * i):min(2 * (i + 1), numChunks + 1)]) for i in range(numChunks / 2 + numChunks % 2)])
+    print ""
+    print "Done with a round of chunk size " + str(chunkSize) + "!"
+    print quantity(summary.count('S'), "chunk") + " survived; " + \
+          quantity(summary.count('-'), "chunk") + " removed."
+    print quantity(atomsSurviving, atom) + " survived; " + \
+          quantity(atomsRemoved, atom) + " removed."
+    print "Which chunks survived: " + printableSummary
+    print ""
+
+    writeTestcaseTemp("did-round-" + str(chunkSize), True);
+
+    return (chunksRemoved > 0)
+
+
+
+#
+# This Strategy attempt at removing members, such as other strategies can then
+# move the lines out-side the functions.  The goal is to rename variable at the
+# same time, such as the program remain valid, while removing the dependency on
+# the object on which the member is.
+#
+#   function Foo() {
+#     this.list = [];
+#   }
+#   Foo.prototype.push = function(a) {
+#     this.list.push(a);
+#   }
+#   Foo.prototype.last = function() {
+#     return this.list.pop();
+#   }
+#
+def replacePropertiesByGlobals():
+    origNumParts = len(parts)
+    chunkSize = min(minimizeMax, 2 * largestPowerOfTwoSmallerThan(origNumParts))
+    finalChunkSize = max(minimizeMin, 1)
+
+    origNumChars = 0
+    for line in parts:
+        origNumChars += len(line)
+
+    numChars = origNumChars
+    while 1:
+        numRemovedChars = tryMakingGlobals(chunkSize, numChars);
+        numChars -= numRemovedChars
+
+        last = (chunkSize == finalChunkSize)
+
+        if numRemovedChars and (minimizeRepeat == "always" or (minimizeRepeat == "last" and last)):
+            # Repeat with the same chunk size
+            pass
+        elif last:
+            # Done
+            break
+        else:
+            # Continue with the next smaller chunk size
+            chunkSize /= 2
+
+    writeTestcase(testcaseFilename)
+
+    print "Lithium is done!"
+
+    if finalChunkSize == 1 and minimizeRepeat != "never":
+        print "  Removing any single " + atom + " from the final file makes it uninteresting!"
+
+    print "  Initial size: " + quantity(origNumChars, "character")
+    print "  Final size: " + quantity(numChars, "character")
+    print "  Tests performed: " + str(testCount)
+    print "  Test total: " + quantity(testTotal, atom)
+
+
+def tryMakingGlobals(chunkSize, numChars):
+    """Make a single run through the testcase, trying to remove chunks of size chunkSize.
+
+    Returns True iff any chunks were removed."""
+
+    global parts
+
+    summary = ""
+
+    numRemovedChars = 0
+    numChunks = divideRoundingUp(len(parts), chunkSize)
+    finalChunkSize = max(minimizeMin, 1)
+
+    # Map words to the chunk indexes in which they are present.
+    words = {}
+    for chunk, line in enumerate(parts):
+        for match in re.finditer(r'(?<=[\w\d_])\.(\w+)', line):
+            word = match.group(1)
+            if not word in words:
+                words[word] = [chunk]
+            else:
+                words[word] += [chunk]
+
+    # All patterns have been removed sucessfully.
+    if len(words) == 0:
+        return 0
+
+    print "Starting a round with chunks of " + quantity(chunkSize, atom) + "."
+    summary = ['S' for i in range(numChunks)]
+
+    for word, chunks in words.items():
+        chunkIndexes = {}
+        for chunkStart in chunks:
+            chunkIdx = int(chunkStart / chunkSize)
+            if not chunkIdx in chunkIndexes:
+                chunkIndexes[chunkIdx] = [chunkStart]
+            else:
+                chunkIndexes[chunkIdx] += [chunkStart]
+
+        for chunkIdx, chunkStarts in chunkIndexes.items():
+            # Unless this is the final size, let's try to remove couple of
+            # prefixes, otherwise wait for the final size to remove each of them
+            # individually.
+            if len(chunkStarts) == 1 and finalChunkSize != chunkSize:
+                continue
+
+            description = "'" + word + "' in "
+            description += "chunk #" + str(chunkIdx) + " of " + str(numChunks) + " chunks of size " + str(chunkSize)
+
+            maybeRemoved = 0
+            newParts = parts
+            for chunkStart in chunkStarts:
+                subst = re.sub("[\w_.]+\." + word, word, newParts[chunkStart])
+                maybeRemoved += len(newParts[chunkStart]) - len(subst)
+                newParts = newParts[:chunkStart] + [ subst ] + newParts[(chunkStart+1):]
+
+            if interesting(newParts):
+                print "Yay, reduced it by removing prefixes of " + description + " :)"
+                numRemovedChars += maybeRemoved
+                summary[chunkIdx] = 's'
+                words[word] = [ c for c in chunks if c not in chunkIndexes ]
+                if len(words[word]) == 0:
+                    del words[word]
+            else:
+                print "Removing prefixes of " + description + " made the file 'uninteresting'."
+
+    numSurvivingChars = numChars - numRemovedChars
+    printableSummary = " ".join(["".join(summary[(2 * i):min(2 * (i + 1), numChunks + 1)]) for i in range(numChunks / 2 + numChunks % 2)])
+    print ""
+    print "Done with a round of chunk size " + str(chunkSize) + "!"
+    print quantity(summary.count('S'), "chunk") + " survived; " + \
+          quantity(summary.count('s'), "chunk") + " shortened."
+    print quantity(numSurvivingChars, "character") + " survived; " + \
+          quantity(numRemovedChars, "character") + " removed."
+    print "Which chunks survived: " + printableSummary
+    print ""
+
+    writeTestcaseTemp("did-round-" + str(chunkSize), True);
+
+    return numRemovedChars
+
+
+#
+# This Strategy attempt at replacing arguments by globals, for each named
+# argument of a function we add a setter of the global of the same name before
+# the function call.  The goal is to remove functions by making empty arguments
+# lists instead.
+#
+#   function foo(a,b) {
+#     list = a + b;
+#   }
+#   foo(2, 3)
+#
+# becomes:
+#
+#   function foo() {
+#     list = a + b;
+#   }
+#   a = 2;
+#   b = 3;
+#   foo()
+#
+# The next logical step is inlining the body of the function at the call-site.
+#
+def replaceArgumentsByGlobals():
+    roundNum = 0
+    while 1:
+        numRemovedArguments = tryArgumentsAsGlobals(roundNum)
+        roundNum += 1
+
+        if numRemovedArguments and (minimizeRepeat == "always" or minimizeRepeat == "last"):
+            # Repeat with the same chunk size
+            pass
+        else:
+            # Done
+            break
+
+    writeTestcase(testcaseFilename)
+
+    print "Lithium is done!"
+    print "  Tests performed: " + str(testCount)
+    print "  Test total: " + quantity(testTotal, atom)
+
+
+def tryArgumentsAsGlobals(roundNum):
+    """Make a single run through the testcase, trying to remove chunks of size chunkSize.
     
+    Returns True iff any chunks were removed."""
+
+    global parts
+
+    numMovedArguments = 0
+    numSurvivedArguments = 0
+
+    # Map words to the chunk indexes in which they are present.
+    functions = {}
+    anonymousQueue = []
+    anonymousStack = []
+    for chunk, line in enumerate(parts):
+        # Match function definition with at least one argument.
+        for match in re.finditer(r'(?:function\s+(\w+)|(\w+)\s*=\s*function)\s*\((\s*\w+\s*(?:,\s*\w+\s*)*)\)', line):
+            fun = match.group(1)
+            if fun is None:
+                fun = match.group(2)
+
+            if match.group(3) == "":
+                args = []
+            else:
+                args = match.group(3).split(',')
+
+            if not fun in functions:
+                functions[fun] = { "defs": args, "argsPattern": match.group(3), "chunk": chunk, "uses": [] }
+            else:
+                functions[fun]["defs"] = args
+                functions[fun]["argsPattern"] = match.group(3)
+                functions[fun]["chunk"] = chunk
+
+
+        # Match anonymous function definition, which are surrounded by parentheses.
+        for match in re.finditer(r'\(function\s*\w*\s*\(((?:\s*\w+\s*(?:,\s*\w+\s*)*)?)\)\s*{', line):
+            if match.group(1) == "":
+                args = []
+            else:
+                args = match.group(1).split(',')
+            anonymousStack += [{ "defs": args, "chunk": chunk, "use": None, "useChunk": 0 }]
+
+        # Match calls of anonymous function.
+        for match in re.finditer(r'}\s*\)\s*\(((?:[^()]|\([^,()]*\))*)\)', line):
+            if len(anonymousStack) == 0:
+                continue
+            anon = anonymousStack[-1]
+            anonymousStack = anonymousStack[:-1]
+            if match.group(1) == "" and len(anon["defs"]) == 0:
+                continue
+            if match.group(1) == "":
+                args = []
+            else:
+                args = match.group(1).split(',')
+            anon["use"] = args
+            anon["useChunk"] = chunk
+            anonymousQueue += [anon]
+
+        # match function calls. (and some definitions)
+        for match in re.finditer(r'((\w+)\s*\(((?:[^()]|\([^,()]*\))*)\))', line):
+            pattern = match.group(1)
+            fun = match.group(2)
+            if match.group(3) == "":
+                args = []
+            else:
+                args = match.group(3).split(',')
+            if not fun in functions:
+                functions[fun] = { "uses": [] }
+            functions[fun]["uses"] += [{ "values": args, "chunk": chunk, "pattern": pattern }]
+
+
+    # All patterns have been removed sucessfully.
+    if len(functions) == 0 and len(anonymousQueue) == 0:
+        return 0
+
+    print "Starting removing function arguments."
+
+    for fun, argsMap in functions.items():
+        description = "arguments of '" + fun + "'"
+        if "defs" not in argsMap or len(argsMap["uses"]) == 0:
+            print "Ignoring " + description + " because it is 'uninteresting'."
+            continue
+
+        maybeMovedArguments = 0
+        newParts = parts
+
+        # Remove the function definition arguments
+        argDefs = argsMap["defs"]
+        defChunk = argsMap["chunk"]
+        subst = string.replace(newParts[defChunk], argsMap["argsPattern"], "", 1)
+        newParts = newParts[:defChunk] + [ subst ] + newParts[(defChunk+1):]
+
+        # Copy callers arguments to globals.
+        for argUse in argsMap["uses"]:
+            values = argUse["values"]
+            chunk = argUse["chunk"]
+            if chunk == defChunk and values == argDefs:
+                continue
+            while len(values) < len(argDefs):
+                values = values + ["undefined"]
+            setters = "".join([ a + " = " + v + ";\n" for a, v in zip(argDefs, values) ])
+            subst = setters + newParts[chunk]
+            newParts = newParts[:chunk] + [ subst ] + newParts[(chunk+1):]
+            maybeMovedArguments += len(values);
+
+        if interesting(newParts):
+            print "Yay, reduced it by removing " + description + " :)"
+            numMovedArguments += maybeMovedArguments
+        else:
+            numSurvivedArguments += maybeMovedArguments
+            print "Removing " + description + " made the file 'uninteresting'."
+
+        for argUse in argsMap["uses"]:
+            chunk = argUse["chunk"]
+            values = argUse["values"]
+            if chunk == defChunk and values == argDefs:
+                continue
+
+            newParts = parts
+            subst = string.replace(newParts[chunk], argUse["pattern"], fun + "()", 1)
+            if newParts[chunk] == subst:
+                continue
+            newParts = newParts[:chunk] + [ subst ] + newParts[(chunk+1):]
+            maybeMovedArguments = len(values);
+
+            descriptionChunk = description + " at " + atom + " #" + str(chunk)
+            if interesting(newParts):
+                print "Yay, reduced it by removing " + descriptionChunk + " :)"
+                numMovedArguments += maybeMovedArguments
+            else:
+                numSurvivedArguments += maybeMovedArguments
+                print "Removing " + descriptionChunk + " made the file 'uninteresting'."
+
+    # Remove immediate anonymous function calls.
+    for anon in anonymousQueue:
+        noopChanges = 0
+        maybeMovedArguments = 0
+        newParts = parts
+
+        argDefs = anon["defs"]
+        defChunk = anon["chunk"]
+        values = anon["use"]
+        chunk = anon["useChunk"]
+        description = "arguments of anonymous function at #" + atom + " " + str(defChunk)
+
+        # Remove arguments of the function.
+        subst = string.replace(newParts[defChunk], ",".join(argDefs), "", 1)
+        if newParts[defChunk] == subst:
+            noopChanges += 1
+        newParts = newParts[:defChunk] + [ subst ] + newParts[(defChunk+1):]
+
+        # Replace arguments by their value in the scope of the function.
+        while len(values) < len(argDefs):
+            values = values + ["undefined"]
+        setters = "".join([ "var " + a + " = " + v + ";\n" for a, v in zip(argDefs, values) ])
+        subst = newParts[defChunk] + "\n" + setters
+        if newParts[defChunk] == subst:
+            noopChanges += 1
+        newParts = newParts[:defChunk] + [ subst ] + newParts[(defChunk+1):]
+
+        # Remove arguments of the anonymous function call.
+        subst = string.replace(newParts[chunk], ",".join(anon["use"]), "", 1)
+        if newParts[chunk] == subst:
+            noopChanges += 1
+        newParts = newParts[:chunk] + [ subst ] + newParts[(chunk+1):]
+        maybeMovedArguments += len(values);
+
+        if noopChanges == 3:
+            continue
+
+        if interesting(newParts):
+            print "Yay, reduced it by removing " + description + " :)"
+            numMovedArguments += maybeMovedArguments
+        else:
+            numSurvivedArguments += maybeMovedArguments
+            print "Removing " + description + " made the file 'uninteresting'."
+
+
+    print ""
+    print "Done with this round!"
+    print quantity(numMovedArguments, "argument") + " moved;"
+    print quantity(numSurvivedArguments, "argument") + " survived."
+
+    writeTestcaseTemp("did-round-" + str(roundNum), True);
+
+    return numMovedArguments
+
 
 # Other reduction algorithms
 # (Use these if you're really frustrated with something you know is 1-minimal.)
+
 
 def tryRemovingAdjacentPairs():
     # XXX capture the idea that after removing (4,5) it might be sensible to remove (3,6)
